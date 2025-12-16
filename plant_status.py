@@ -1,43 +1,92 @@
-from keras.models import load_model  # TensorFlow is required for Keras to work
-from PIL import Image, ImageOps  # Install pillow instead of PIL
-import numpy as np
+import os, time, cv2, numpy as np, requests
+from tflite_runtime.interpreter import Interpreter
 
-# Disable scientific notation for clarity
-np.set_printoptions(suppress=True)
+TFLITE_PATH = os.getenv("TFLITE_PATH", "tomato_model.tflite")
+ESP32_IP    = os.getenv("ESP32_IP", "192.168.4.1")
+URL         = f"http://{ESP32_IP}/api/ai"
+CAM_INDEX   = int(os.getenv("CAM_INDEX", "0"))
+IMG_SIZE    = int(os.getenv("IMG_SIZE", "256"))
+SEND_EVERY  = float(os.getenv("SEND_EVERY_SEC", "2.0"))
 
-# Load the model
-model = load_model("keras_Model.h5", compile=False)
+CLASS_NAMES = [
+    "Tomato___Bacterial_spot","Tomato___Early_blight","Tomato___Late_blight",
+    "Tomato___Leaf_Mold","Tomato___Septoria_leaf_spot",
+    "Tomato___Spider_mites Two-spotted_spider_mite","Tomato___Target_Spot",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus","Tomato___Tomato_mosaic_virus",
+    "Tomato___healthy",
+]
+HEALTHY_CLASS_NAME = "Tomato___healthy"
 
-# Load the labels
-class_names = open("labels.txt", "r").readlines()
+def softmax(x):
+    x = x.astype(np.float32)
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
 
-# Create the array of the right shape to feed into the keras model
-# The 'length' or number of images you can put into the array is
-# determined by the first position in the shape tuple, in this case 1
-data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
+def preprocess(frame_bgr):
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    x = rgb.astype(np.float32) / 255.0
+    return np.expand_dims(x, 0)  # NHWC
 
-# Replace this with the path to your image
-image = Image.open("<IMAGE_PATH>").convert("RGB")
+def main():
+    print("Loading:", TFLITE_PATH)
+    intr = Interpreter(model_path=TFLITE_PATH, num_threads=2)
+    intr.allocate_tensors()
+    in0  = intr.get_input_details()[0]
+    out0 = intr.get_output_details()[0]
+    print("Input:", in0["shape"], in0["dtype"])
+    print("Output:", out0["shape"], out0["dtype"])
+    print("ESP32:", URL)
 
-# resizing the image to be at least 224x224 and then cropping from the center
-size = (224, 224)
-image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {CAM_INDEX}")
 
-# turn the image into a numpy array
-image_array = np.asarray(image)
+    last_send = 0.0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("⚠ camera read failed")
+            time.sleep(0.2)
+            continue
 
-# Normalize the image
-normalized_image_array = (image_array.astype(np.float32) / 127.5) - 1
+        x = preprocess(frame)
 
-# Load the image into the array
-data[0] = normalized_image_array
+        # Nếu model đòi NCHW thì bật dòng này:
+        # x = np.transpose(x, (0,3,1,2))
 
-# Predicts the model
-prediction = model.predict(data)
-index = np.argmax(prediction)
-class_name = class_names[index]
-confidence_score = prediction[0][index]
+        intr.set_tensor(in0["index"], x)
+        intr.invoke()
+        y = intr.get_tensor(out0["index"])[0]
 
-# Print prediction and confidence score
-print("Class:", class_name[2:], end="")
-print("Confidence Score:", confidence_score)
+        # y có thể là logits hoặc probs
+        probs = softmax(y) if (y.ndim == 1 and (y.max() > 1.0 or y.min() < 0.0)) else y
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        raw = CLASS_NAMES[idx]
+        healthy = (raw == HEALTHY_CLASS_NAME)
+
+        now = time.time()
+        if now - last_send >= SEND_EVERY:
+            payload = {"healthy": bool(healthy), "score": float(conf)}
+            try:
+                r = requests.post(URL, json=payload, timeout=3)
+                print(f"📤 {payload} raw={raw} -> {r.status_code}")
+            except Exception as e:
+                print("❌ Send failed:", e)
+            last_send = now
+
+        # preview (q to quit)
+        txt = f"{'HEALTHY' if healthy else 'UNHEALTHY'} {conf*100:.1f}%"
+        cv2.putText(frame, txt, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0,255,0) if healthy else (0,0,255), 2)
+        cv2.imshow("Planty TFLite", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
